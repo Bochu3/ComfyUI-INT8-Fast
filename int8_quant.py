@@ -639,11 +639,19 @@ if _COMFY_OPS_AVAILABLE:
                 
                 # INT8 quantized path
                 if need_cast:
-                    # VBAR / offload / lowvram path
-                    weight, bias, offload_stream = cast_bias_weight(
+                    # VBAR / offload / lowvram path.
+                    # offloadable=False on purpose: the INT8 path below launches Triton
+                    # kernels (quantize, matmul+dequant, ConvRot, autotune benchmarking)
+                    # that keep reading `weight` after cast_bias_weight() returns. With
+                    # async offload, `weight` is a view into a shared cast buffer whose
+                    # only lifetime guarantee is the offload_stream.wait_stream() inside
+                    # uncast_bias_weight(), so the next layer's H2D copy can overwrite it
+                    # mid-kernel -> CUDA illegal memory access. Upstream issue #97.
+                    weight, bias = cast_bias_weight(
                         self, input=None, dtype=torch.int8, device=x.device,
-                        bias_dtype=x.dtype, offloadable=True
+                        bias_dtype=x.dtype, offloadable=False
                     )
+                    offload_stream = None
                 else:
                     # Fast path: weights already on GPU, no functions to apply
                     weight = self.weight
@@ -698,7 +706,7 @@ if _COMFY_OPS_AVAILABLE:
                     else:
                         y = y + lora_y.to(y.dtype)
                 
-                if need_cast:
+                if offload_stream is not None:
                     uncast_bias_weight(self, weight, bias, offload_stream)
                 return y.reshape(*x_shape[:-1], y.shape[-1])
         
