@@ -16,7 +16,9 @@ def _quantize_rowwise_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     # Row index we are processing
-    row_idx = tl.program_id(0)
+    # int64 so that `row_idx * n_elements` below cannot wrap: on video models
+    # rows * cols exceeds 2^31 (see the M*K note in the matmul kernels).
+    row_idx = tl.program_id(0).to(tl.int64)
     
     # Pointers to the start of the row
     x_row_ptr = x_ptr + row_idx * n_elements
@@ -121,8 +123,15 @@ def _int8_matmul_dequant_kernel(
 
     # 1. Prepare Pointers for A and B
     # A block pointer: [BLOCK_M, BLOCK_K]
-    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
-    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    # tl.arange returns int32 and the strides arrive as plain ints, so the
+    # offset products below are computed in 32-bit. stride_am is K and
+    # stride_cm is N, so `offs_am * stride_am` (load) and `stride_cm * offs_am`
+    # (store) wrap negative once M*K or M*N passes 2^31 -> cudaErrorIllegalAddress.
+    # Video models reach that easily: MiniMax H3 at 1152x640x362f has M=308160,
+    # which overflows for any K or N above ~6970. Cast once here; everything
+    # downstream promotes to int64 automatically.
+    offs_am = ((pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M).to(tl.int64)
+    offs_bn = ((pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N).to(tl.int64)
     offs_k = tl.arange(0, BLOCK_K)
     
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
@@ -282,8 +291,9 @@ def _int8_matmul_dequant_per_row_kernel(
     pid_n = (pid % num_pid_in_group) // group_size_m
 
     # 1. Prepare Pointers for A and B
-    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
-    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    # int64 for the same M*K / M*N overflow reason as _int8_matmul_dequant_kernel.
+    offs_am = ((pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M).to(tl.int64)
+    offs_bn = ((pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N).to(tl.int64)
     offs_k = tl.arange(0, BLOCK_K)
 
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
