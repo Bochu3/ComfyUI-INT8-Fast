@@ -168,6 +168,31 @@ try:
 except ImportError:
     _COMFY_OPS_AVAILABLE = False
 
+def _swiglu(x: Tensor) -> Tensor:
+    gate, up = x.chunk(2, dim=-1)
+    return F.silu(gate) * up
+
+_FALLBACK_INPUT_ACT = {
+    "swiglu": _swiglu,
+    "gelu_tanh": lambda x: F.gelu(x, approximate="tanh"),
+}
+
+def _apply_input_act(x: Tensor, input_act, act_weight=None, act_eps=0.0) -> Tensor:
+    """
+    Eager version of core's fused Linear input activation. Uses core's own helper
+    (which also handles "rms_norm") so results match; the fallback only covers the
+    activations core had when this API was introduced, in case the helper moves.
+    """
+    if input_act is None:
+        return x
+    import comfy.ops
+    core_impl = getattr(comfy.ops, "_eager_input_act", None)
+    if core_impl is not None:
+        return core_impl(x, input_act, act_weight, act_eps)
+    if input_act not in _FALLBACK_INPUT_ACT:
+        raise NotImplementedError(f"INT8 Linear: unsupported input_act '{input_act}' for this ComfyUI version")
+    return _FALLBACK_INPUT_ACT[input_act](x)
+
 
 if _COMFY_OPS_AVAILABLE:
     class Int8TensorwiseOps(manual_cast):
@@ -617,7 +642,17 @@ if _COMFY_OPS_AVAILABLE:
                 else:
                     self.bias = nn.Parameter(new_bias, requires_grad=False)
 
-            def forward(self, x: Tensor) -> Tensor:
+            def forward(self, x: Tensor, input_act=None, act_weight=None, act_eps=0.0,
+                        residual=None, residual_scale=None) -> Tensor:
+                # Newer ComfyUI core passes fused-op args through Linear.forward:
+                # `linear(act(x))`, optionally `residual + residual_scale * linear(...)`.
+                x = _apply_input_act(x, input_act, act_weight, act_eps)
+                out = self._forward_linear(x)
+                if residual is not None:
+                    out = torch.addcmul(residual, out.to(residual.dtype), residual_scale)
+                return out
+
+            def _forward_linear(self, x: Tensor) -> Tensor:
                 """Fast forward using torch._int_mm for quantized weights."""
                 
                 # Check if ComfyUI needs to manage weight transfer (VBAR, offloading, LoRA patches, etc.)
