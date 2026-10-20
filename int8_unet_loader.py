@@ -155,6 +155,13 @@ class UNetLoaderINTW8A8:
 
         # Load state dict once to detect model and prepare LoRA
         sd, metadata = comfy.utils.load_torch_file(unet_path, return_metadata=True)
+
+        # ComfyUI only expands header-level _quantization_metadata into per-layer
+        # comfy_quant tensors when no custom_operations are set, so do it here.
+        # Without this, ConvRot flags from such files are lost and output is noise.
+        if metadata and "_quantization_metadata" in metadata:
+            sd, metadata = comfy.utils.convert_old_quants(sd, "", metadata=metadata)
+            logging.info("INT8 Fast: Converted _quantization_metadata to per-layer comfy_quant.")
         
         # Pre-load LoRA if selected to bake it during quantization
         Int8TensorwiseOps.lora_patches = {}
