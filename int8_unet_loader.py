@@ -13,6 +13,29 @@ import logging
 from .int8_quant import Int8TensorwiseOps
 
 
+def _reprefix_comfy_quant(sd, unet_prefix):
+    """Move per-layer comfy_quant keys under the same prefix as their weights.
+
+    Some converters save weights as "model.diffusion_model.<layer>.weight" but the
+    quantization config as "<layer>.comfy_quant" (or only in the header metadata,
+    which convert_old_quants also expands without a prefix). ComfyUI then strips the
+    prefix with filter_keys=True, which drops every unprefixed key, so the ConvRot
+    flags are lost and the output is noise. Returns the number of keys moved.
+    """
+    if not unet_prefix:
+        return 0
+    suffix = ".comfy_quant"
+    moved = 0
+    for k in [k for k in sd.keys() if k.endswith(suffix) and not k.startswith(unet_prefix)]:
+        layer = k[:-len(suffix)]
+        if unet_prefix + k in sd:
+            continue
+        if (unet_prefix + layer + ".weight") in sd and (layer + ".weight") not in sd:
+            sd[unet_prefix + k] = sd.pop(k)
+            moved += 1
+    return moved
+
+
 def _load_int8_unet_cached_patcher(unet_name, weight_dtype, model_type, on_the_fly_quantization, enable_convrot, lora_mode, pre_lora=None, disable_dynamic=False):
     return UNetLoaderINTW8A8().load_unet(
         unet_name,
@@ -162,7 +185,13 @@ class UNetLoaderINTW8A8:
         if metadata and "_quantization_metadata" in metadata:
             sd, metadata = comfy.utils.convert_old_quants(sd, "", metadata=metadata)
             logging.info("INT8 Fast: Converted _quantization_metadata to per-layer comfy_quant.")
-        
+
+        # comfy_quant keys must share the weights' prefix, or they are dropped when
+        # load_diffusion_model_state_dict strips it.
+        moved = _reprefix_comfy_quant(sd, comfy.model_detection.unet_prefix_from_state_dict(sd))
+        if moved:
+            logging.info(f"INT8 Fast: Moved {moved} comfy_quant keys under the model prefix.")
+
         # Pre-load LoRA if selected to bake it during quantization
         Int8TensorwiseOps.lora_patches = {}
         if len(loras_to_load) > 0:
